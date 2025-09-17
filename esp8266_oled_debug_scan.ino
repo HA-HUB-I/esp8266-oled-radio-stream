@@ -1,170 +1,298 @@
 /*
-  ESP8266 OLED Debug Scanner
-  - Prints logs to Serial (115200)
-  - Scans common I2C pin pairs to find SSD1306
-  - Detects address (0x3C or 0x3D)
-  - If found, initializes OLED and shows a test screen
-  - Then tries Wi-Fi connect (optional) and prints status
+  ESP8266 + SSD1306 128x64 (GPIO14/12, addr 0x3C)
+  Boot -> Wi‑Fi -> NTP -> Ready + MP3 Stream test (no DAC/PCM5102 required)
 
-  Select Board: NodeMCU 1.0 (ESP-12E Module)
+  FIXED: Use AudioFileSourceBuffer with explicit static buffer (no begin()).
 */
 
 #include <Arduino.h>
+#include <ESP8266WiFi.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <ESP8266WiFi.h>
+#include <time.h>
 
-// ===== USER: Wi-Fi (optional for quick test) =====
+// ESP8266Audio
+#include <AudioFileSourceICYStream.h>
+#include <AudioFileSourceBuffer.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutputNull.h>            // no audio output (for testing)
+
+// ===== USER SETTINGS =====
 const char* WIFI_SSID = "ddwrt";
 const char* WIFI_PASS = "";
+const char* STATION_URL = "http://g5.turbohost.eu:8002/stream96";
 
-// Candidate I2C pin pairs (SDA,SCL)
-struct PinPair { uint8_t sda; uint8_t scl; const char* name; };
-PinPair candidates[] = {
-  {4, 5,  "SDA=GPIO4(D2), SCL=GPIO5(D1)"},      // Most common
-  {0, 2,  "SDA=GPIO0(D3), SCL=GPIO2(D4)"},      // Some boards
-  {2, 14, "SDA=GPIO2(D4), SCL=GPIO14(D5)"},     // Rare
-  {14, 12,"SDA=GPIO14(D5), SCL=GPIO12(D6)"},    // Rare
-  {5, 4,  "SDA=GPIO5(D1), SCL=GPIO4(D2)"}       // Fallback try
-};
-
+// ===== Display config =====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET -1
+#define OLED_RESET   -1
+#define OLED_ADDR    0x3C
+#define I2C_SDA      14   // GPIO14 (D5)
+#define I2C_SCL      12   // GPIO12 (D6)
 
-Adafruit_SSD1306* oled = nullptr;
-uint8_t foundSDA = 0xFF, foundSCL = 0xFF, foundAddr = 0xFF;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-bool i2cDevicePresent(uint8_t addr) {
-  Wire.beginTransmission(addr);
-  return (Wire.endTransmission() == 0);
-}
+// ===== Timers =====
+const uint32_t TIME_REFRESH_MS = 250;
+const uint32_t WIFI_POLL_MS    = 1000;
+const uint32_t IP_SHOW_MS      = 3000;
+const uint32_t META_SHOW_MS    = 6000;
 
-bool scanOnPins(uint8_t sda, uint8_t scl) {
-  Wire.begin(sda, scl);
-  delay(20);
-  Serial.printf("Scanning on %s...\n", (String("SDA=")+sda+", SCL="+scl).c_str());
+// ===== NTP servers =====
+const char* NTP_1 = "pool.ntp.org";
+const char* NTP_2 = "time.google.com";
+const char* NTP_3 = "time.cloudflare.com";
 
-  bool hit = false;
-  for (uint8_t addr = 0x08; addr <= 0x7F; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.printf("  I2C device found at 0x%02X\n", addr);
-      if (addr == 0x3C || addr == 0x3D) {
-        foundSDA = sda;
-        foundSCL = scl;
-        foundAddr = addr;
-        hit = true;
-        break;
-      }
-    }
-    delay(2);
+// ===== State =====
+enum UiState { BOOTING, WIFI_CONNECTING, TIME_SYNC, READY };
+UiState uiState = BOOTING;
+
+uint32_t lastTimeDraw = 0;
+uint32_t lastWifiPoll = 0;
+uint32_t connectStart = 0;
+bool     haveIpSplash = false;
+uint32_t ipSplashSince = 0;
+String   ipStr;
+
+String   icyName = "";
+String   icyTitle = "";
+uint32_t lastMetaTs = 0;
+bool     showMeta = false;
+
+const char spinnerFrames[] = {'|','/','-','\\'};
+uint8_t spinnerIdx = 0;
+
+String two(int v){ return (v<10) ? "0"+String(v) : String(v); }
+
+// ===== Audio objects =====
+AudioGeneratorMP3   *mp3 = nullptr;
+AudioFileSourceICYStream *file = nullptr;
+AudioFileSourceBuffer *buff = nullptr;
+AudioOutputNull     *out = nullptr;
+
+// Provide a static buffer for AudioFileSourceBuffer (8KB)
+static uint8_t audioBuf[8192];
+
+// Metadata callback
+void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
+  (void)cbData; (void)isUnicode;
+  String t = String(type);
+  String s = String(string);
+  if (t.equalsIgnoreCase("StreamTitle")) {
+    icyTitle = s;
+    showMeta = true;
+    lastMetaTs = millis();
+  } else if (t.equalsIgnoreCase("StreamName")) {
+    icyName = s;
+    showMeta = true;
+    lastMetaTs = millis();
   }
-  return hit;
 }
 
-void tryFindOled() {
-  Serial.println("\n=== I2C OLED auto-detect ===");
-  for (auto &p : candidates) {
-    Serial.printf("Trying pins: %s\n", p.name);
-    if (scanOnPins(p.sda, p.scl)) {
-      Serial.printf("SSD1306 candidate found at addr 0x%02X on %s\n",
-        foundAddr, p.name);
-      return;
-    }
+void drawWifiBars(int rssi, bool connected) {
+  int bars = 0;
+  if (connected) {
+    if      (rssi > -55) bars = 4;
+    else if (rssi > -65) bars = 3;
+    else if (rssi > -75) bars = 2;
+    else if (rssi > -85) bars = 1;
+    else                 bars = 0;
+  }
+  const int x = SCREEN_WIDTH - 18;
+  const int y = 2;
+  const int w = 3;
+  const int s = 2;
+  for (int i = 0; i < 4; i++) {
+    int barH = (i+1) * 2;
+    int bx = x + i*(w + s);
+    int by = y + (8 - barH);
+    if (i < bars) display.fillRect(bx, by, w, barH, SSD1306_WHITE);
+    else          display.drawRect(bx, by, w, barH, SSD1306_WHITE);
   }
 }
 
-void drawTestScreen() {
-  oled->clearDisplay();
-  oled->setTextSize(1);
-  oled->setTextColor(SSD1306_WHITE);
-  oled->setCursor(0,0);
-  oled->println(F("ESP8266 OLED Test"));
-  oled->drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
-  oled->setCursor(0, 16);
-  oled->println(F("HELLO OLED :)"));
-  oled->setCursor(0, 28);
-  oled->print(F("I2C: SDA=")); oled->print(foundSDA);
-  oled->print(F(" SCL=")); oled->println(foundSCL);
-  oled->setCursor(0, 40);
-  oled->print(F("Addr: 0x")); oled->println(foundAddr, HEX);
+void drawBoot(const __FlashStringHelper* subtitle) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("ESP8266 Radio"));
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+  display.setCursor(0, 18);
+  display.print(F("Booting "));
+  display.write(spinnerFrames[spinnerIdx]);
+  spinnerIdx = (spinnerIdx + 1) % 4;
+  display.setCursor(0, 30);
+  display.println(subtitle);
+  display.display();
+}
 
-  // Wi-Fi quick status
-  oled->setCursor(0, 52);
-  if (WiFi.isConnected()) {
-    oled->print(F("WiFi OK: "));
-    oled->print(WiFi.localIP());
+bool timeIsSet() {
+  time_t now = time(nullptr);
+  return now > 1700000000; // coarse check ~2023-11-14
+}
+
+void setupTimezone() {
+  // Europe/Sofia: EET-2EEST,M3.5.0/3,M10.5.0/4
+  setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
+  tzset();
+}
+
+void drawReady() {
+  time_t now = time(nullptr);
+  struct tm tm_info;
+  localtime_r(&now, &tm_info);
+
+  String hh = two(tm_info.tm_hour);
+  String mm = two(tm_info.tm_min);
+  String ss = two(tm_info.tm_sec);
+  String DD = two(tm_info.tm_mday);
+  String MM = two(tm_info.tm_mon + 1);
+  int year  = tm_info.tm_year + 1900;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.print(F("Ready"));
+  drawWifiBars(WiFi.isConnected() ? WiFi.RSSI() : -100, WiFi.isConnected());
+
+  // Time
+  display.setTextSize(2);
+  display.setCursor(6,16);
+  display.print(hh); display.print(":"); display.print(mm); display.print(":"); display.print(ss);
+
+  // Date
+  display.setTextSize(1);
+  display.setCursor(8,42);
+  display.print(DD); display.print("."); display.print(MM); display.print("."); display.print(year);
+
+  // Stream line
+  display.setCursor(0,54);
+  if (mp3 && mp3->isRunning()) {
+    if (showMeta && (millis() - lastMetaTs) < META_SHOW_MS) {
+      String line = icyTitle.length() ? icyTitle : icyName;
+      if (line.length() > 20) line = line.substring(0, 20);
+      display.print(F("♪ "));
+      display.print(line);
+    } else {
+      display.print(F("STREAM: playing"));
+    }
   } else {
-    oled->print(F("WiFi: not connected"));
+    display.print(F("STREAM: stopped"));
   }
-  oled->display();
+
+  display.display();
+}
+
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  connectStart = millis();
+}
+
+void startStream() {
+  // Clean previous if any
+  if (mp3) { mp3->stop(); delete mp3; mp3 = nullptr; }
+  if (buff){ delete buff; buff = nullptr; }
+  if (file){ delete file; file = nullptr; }
+  if (out) { delete out;  out  = nullptr; }
+
+  file = new AudioFileSourceICYStream(STATION_URL);
+  file->RegisterMetadataCB(MDCallback, nullptr);
+
+  // Use explicit static buffer, no begin() call needed
+  buff = new AudioFileSourceBuffer(file, audioBuf, sizeof(audioBuf));
+
+  out = new AudioOutputNull();   // no audio out (for now)
+
+  mp3 = new AudioGeneratorMP3();
+  mp3->begin(buff, out);
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("\n\nESP8266 OLED Debug Scanner starting...");
-  pinMode(LED_BUILTIN, OUTPUT);
+  delay(100);
 
-  tryFindOled();
-
-  if (foundAddr == 0xFF) {
-    Serial.println("ERROR: SSD1306 not found on common pins/addresses.");
-    Serial.println("Tips:");
-    Serial.println(" - Check 3.3V and GND");
-    Serial.println(" - Verify I2C pull-ups (usually onboard)");
-    Serial.println(" - Some modules use 0x3D, others 0x3C");
-    Serial.println(" - Try re-soldering or reseating jumper wires");
-    // Blink LED fast to signal failure
+  // OLED init
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 begin() failed."));
+    pinMode(LED_BUILTIN, OUTPUT);
     while (true) {
-      digitalWrite(LED_BUILTIN, LOW); delay(120);
-      digitalWrite(LED_BUILTIN, HIGH); delay(120);
+      digitalWrite(LED_BUILTIN, LOW); delay(150);
+      digitalWrite(LED_BUILTIN, HIGH); delay(150);
     }
   }
+  display.clearDisplay(); display.display();
 
-  // Init OLED on found pins/address
-  Wire.begin(14, 12);  // SDA=GPIO14, SCL=GPIO12
-  oled = new Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-  if (!oled->begin(SSD1306_SWITCHCAPVCC, foundAddr)) {
-    Serial.println("ERROR: SSD1306 begin() failed even though address replied.");
-    while (true) {
-      digitalWrite(LED_BUILTIN, LOW); delay(500);
-      digitalWrite(LED_BUILTIN, HIGH); delay(500);
-    }
-  }
-  Serial.printf("SSD1306 OK at 0x%02X using SDA=%u SCL=%u\n", foundAddr, foundSDA, foundSCL);
-
-  // Optional: Wi-Fi connect (non-blocking-ish)
-  Serial.printf("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 10000) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Wi-Fi connected, IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Wi-Fi not connected (timeout).");
-  }
-
-  drawTestScreen();
-  Serial.println("OLED test screen drawn.");
+  uiState = WIFI_CONNECTING;
+  drawBoot(F("Wi-Fi connecting…"));
+  connectWifi();
 }
 
 void loop() {
-  static uint32_t last = 0;
-  static bool ledState = false;
+  if (uiState == WIFI_CONNECTING) {
+    static uint32_t lastBootDraw = 0;
+    if (millis() - lastBootDraw > 150) {
+      lastBootDraw = millis();
+      drawBoot(F("Wi-Fi connecting…"));
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      ipStr = WiFi.localIP().toString();
+      haveIpSplash = true;
+      ipSplashSince = millis();
+      uiState = TIME_SYNC;
+      drawBoot(F("Sync time…"));
+      setupTimezone();
+      configTime(0, 0, NTP_1, NTP_2, NTP_3);
+    } else if (millis() - connectStart > 20000) {
+      WiFi.disconnect(true);
+      delay(250);
+      connectWifi();
+    }
+  }
 
-  if (millis() - last > 1000) {
-    last = millis();
-    ledState = !ledState;                 // обръщаме състоянието
-    digitalWrite(LED_BUILTIN, ledState);  // записваме го
+  if (uiState == TIME_SYNC) {
+    static uint32_t lastBootDraw = 0;
+    if (millis() - lastBootDraw > 250) {
+      lastBootDraw = millis();
+      drawBoot(F("Sync time…"));
+    }
+    if (timeIsSet()) {
+      uiState = READY;
+      startStream();
+    }
+  }
+
+  if (millis() - lastWifiPoll > WIFI_POLL_MS) {
+    lastWifiPoll = millis();
+    if (uiState == READY && WiFi.status() != WL_CONNECTED) {
+      uiState = WIFI_CONNECTING;
+      if (mp3) { mp3->stop(); }
+      connectWifi();
+    }
+  }
+
+  if (uiState == READY) {
+    if (mp3) {
+      if (mp3->isRunning()) {
+        if (!mp3->loop()) {
+          mp3->stop();
+        }
+      } else {
+        static uint32_t lastTry = 0;
+        if (millis() - lastTry > 3000) {
+          lastTry = millis();
+          startStream();
+        }
+      }
+    }
+
+    if (millis() - lastTimeDraw > TIME_REFRESH_MS) {
+      lastTimeDraw = millis();
+      drawReady();
+    }
   }
 }
